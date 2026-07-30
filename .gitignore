@@ -1,0 +1,80 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+dist/
+*.egg-info/
+
+# Virtual environments
+env/
+venv/
+.venv/
+venv*/
+ENV/
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+.pytest_cache/
+
+# Jupyter
+.ipynb_checkpoints
+
+# IDEs and editors
+.vscode/
+.idea/
+*.iml
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Data, checkpoints, large outputs
+data/
+data/*
+checkpoint/
+checkpoint/*
+checkpoints/
+checkpoints/*
+Figures/
+Figures/*
+
+# Model weights and checkpoints
+*.pth
+*.pt
+*.ckpt
+*.h5
+
+# Logs and databases
+logs/
+*.log
+*.sqlite3
+*.db
+
+# Env files
+.env
+.env.*
+
+# Python wheel metadata
+pip-wheel-metadata/
+
+# Misc
+*.orig
+
+# Keep project source (model/ utils/ etc.) tracked
+# (Do not ignore the `model/` package source code.)
