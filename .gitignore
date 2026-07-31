@@ -53,6 +53,8 @@ checkpoints/
 checkpoints/*
 Figures/
 Figures/*
+eva/
+train_res/
 
 # Model weights and checkpoints
 *.pth
