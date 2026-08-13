@@ -77,13 +77,15 @@ def eval_psnr_on_subset(net, samples, device):
 def get_all_removable_blocks(net):
     """
     Tra ve list (stage_name, block_index, n_blocks_in_stage) cho MOI block co the thu xoa.
-    KHONG bao gom stage chi co 1 block (xoa het se lam Stage rong -> shape van OK vi Sequential
-    rong tra ve nguyen input, nhung day la truong hop dac biet, tam thoi LOAI TRU de an toan).
+    QUAN TRONG: doc so luong khoi THAT SU con lai trong tung Stage (khong dung
+    DEPTH_CONFIG tinh co dinh) -- vi sau moi lan xoa vinh vien, so khoi da thay doi.
     """
     removable = []
-    for stage_name, n_blocks in zip(STAGE_NAMES, DEPTH_CONFIG):
+    for stage_name in STAGE_NAMES:
+        stage_module = getattr(net.module, stage_name)
+        n_blocks = len(stage_module.blocks)  # so khoi THAT hien tai, khong phai tu DEPTH_CONFIG
         if n_blocks <= 1:
-            continue  # khong xoa Stage chi co dung 1 block -- tranh lam rong hoan toan 1 tang
+            continue  # khong xoa Stage chi con dung 1 block -- tranh lam rong hoan toan 1 tang
         for block_idx in range(n_blocks):
             removable.append((stage_name, block_idx, n_blocks))
     return removable
