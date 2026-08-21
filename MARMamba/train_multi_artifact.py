@@ -33,6 +33,10 @@ import time
 import argparse
 import numpy as np
 import torch
+torch.set_num_threads(1)  # gioi han so luong CPU threads PyTorch tu sinh ra
+                          # -- can thiet vi container gioi han pids.max=256 (rat thap)
+import torch.multiprocessing
+torch.multiprocessing.set_sharing_strategy('file_system')  # tranh loi het /dev/shm khi dung DataLoader multiprocessing
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
@@ -182,11 +186,13 @@ def main():
     train_dataset = AAPMTrainDatasetWithMaterials(
         args.crop_size, args.train_data_dir, random_flip=True, random_rotate=True)
     train_loader = DataLoader(train_dataset, batch_size=args.train_batch_size,
-                                shuffle=True, num_workers=4)
+                                shuffle=True, num_workers=0)
 
     lpips_loss_fn = lpips.LPIPS(net='vgg', spatial=False).to(device)
 
-    file_path = "./eva_multi_artifact/eva.txt"
+    # Gop chung ve "./eva/" -- NHAT QUAN voi noi test_image() da ghi anh output/gt,
+    # tach rieng thu muc chi de luu 1 file .txt la khong can thiet
+    file_path = "./eva/eva.txt"
     total_steps = 0
     if args.checkpoint:
         try:
@@ -235,7 +241,10 @@ def main():
                 with torch.no_grad():
                     total_image, time_avg = test_image(args.val_data_dir, net)
                     print(f"test speed: {time_avg} per image")
-                    results_path, gt_path = "./eva_multi_artifact/output", "./eva_multi_artifact/gt"
+                    # SUA LOI: test_image() (trong utils/aapm_dataset.py) GHI CUNG vao
+                    # "./eva/output" va "./eva/gt" -- KHONG PHAI duong dan tuy dat
+                    # "./eva_multi_artifact/..." -- phai doc DUNG cho khop
+                    results_path, gt_path = "./eva/output", "./eva/gt"
                     imgsName = sorted(os.listdir(results_path))
                     gtsName = sorted(os.listdir(gt_path))
                     assert len(imgsName) == len(gtsName)
@@ -253,6 +262,9 @@ def main():
                     rmse_avg = rmse_all / len(imgsName)
                     print(f'Testing: PSNR={psnr:.4f} SSIM={ssim:.4f} RMSE={rmse_avg:.4f}')
 
+                    # SUA LOI: open() KHONG tu tao thu muc cha (khac save_image() co tu tao)
+                    # -- phai tao thu muc "./eva_multi_artifact/" TRUOC khi ghi file
+                    os.makedirs(os.path.dirname(file_path), exist_ok=True)
                     mode = 'a' if os.path.exists(file_path) else 'w'
                     with open(file_path, mode) as f:
                         f.write(f"steps:{total_steps}, PSNR:{psnr}, SSIM:{ssim}, RMSE:{rmse_avg}\n")
