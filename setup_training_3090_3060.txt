@@ -1,4 +1,14 @@
+#for RTX 3060
+pip install --no-cache-dir \
+  torch==2.11.0 \
+  torchvision==0.26.0 \
+  torchaudio==2.11.0 \
+  --index-url https://download.pytorch.org/whl/cu128
+
+#for RTX 3090
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu130
+
+
 
 python3 -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
 
