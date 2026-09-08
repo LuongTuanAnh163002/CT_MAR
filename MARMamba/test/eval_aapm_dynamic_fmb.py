@@ -29,7 +29,7 @@ import sys
 sys.path.append('../')
 sys.path.insert(0, ".")
 
-from model.mamba_exp1 import MambaFormer
+from model.mamba_exp1 import MetalGuidedMambaFormer
 from utils.metrics import calculate_psnr, calculate_ssim, calculate_rmse
 
 HU_MIN, HU_MAX = -1000.0, 3000.0
@@ -147,7 +147,7 @@ def to_lpips_tensor(img_bgr3_uint8, device):
 
 def load_model(checkpoint_path, device, guidance_temperature=1.0):
     """Load Dynamic FMB model, supporting both plain state_dict and full checkpoints."""
-    net = MambaFormer(
+    net = MetalGuidedMambaFormer(
         in_channels=1,
         guidance_temperature=guidance_temperature,
     ).to(device)
