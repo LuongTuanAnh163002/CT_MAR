@@ -146,24 +146,32 @@ def to_lpips_tensor(img_bgr3_uint8, device):
 
 
 def load_model(checkpoint_path, device, guidance_temperature=1.0):
-    """Load Dynamic FMB model, supporting both plain state_dict and full checkpoints."""
+    """
+    Load Dynamic FMB on ONE device for evaluation.
+
+    Important:
+    - Evaluation processes one image at a time, so DataParallel is unnecessary.
+    - Checkpoints saved during multi-GPU training may contain the "module." prefix.
+      Strip it before loading into the plain model.
+    - Supports both plain state_dict checkpoints and full checkpoint dictionaries.
+    """
     net = MetalGuidedMambaFormer(
         in_channels=1,
         guidance_temperature=guidance_temperature,
     ).to(device)
 
-    device_ids = [i for i in range(torch.cuda.device_count())] or [0]
-    net = nn.DataParallel(net, device_ids=device_ids)
-
     state = torch.load(checkpoint_path, map_location=device)
+
+    # Support future/full checkpoint format.
     if isinstance(state, dict) and "model" in state:
         state = state["model"]
 
-    # Match DataParallel key format used by this evaluator.
-    keys = list(state.keys())
-    has_module_prefix = bool(keys) and all(k.startswith("module.") for k in keys)
-    if not has_module_prefix:
-        state = {"module." + k: v for k, v in state.items()}
+    # Training may have used nn.DataParallel, producing "module.xxx" keys.
+    if any(k.startswith("module.") for k in state.keys()):
+        state = {
+            k[len("module."):]: v
+            for k, v in state.items()
+        }
 
     net.load_state_dict(state, strict=True)
     net.eval()
