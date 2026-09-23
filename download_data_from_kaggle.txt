@@ -1,4 +1,7 @@
-export KAGGLE_USERNAME="luongtuananh"                                                                                                                                         4  export KAGGLE_USERNAME="luongtuananh"                                                                                                                                         4  export KAGGLE_USERNAME="luongtuananh"                                                                                                                                         4  export KAGGLE_USERNAME="luongtuananh"                                                                                                                                         4  export KAGGLE_USERNAME="luongtuananh"                                                                                                                                         4  export KAGGLE_USERNAME="luongtuananh"                   4  export KAGGLE_USERNAME="luongtuananh"                     4  export KAGGLE_USERNAME="luongtuananh"  export KAGGLE_USERNAME="luongtuananh"
+python3 -m pip install --user kaggle
+export PATH="$HOME/.local/bin:$PATH"
+kaggle --version
+export KAGGLE_USERNAME="luongtuananh"
 export KAGGLE_API_TOKEN=KGA-.....
 kaggle competitions list
 kaggle datasets download -d luongtuananh/aapm-ct-mar-8k-v2
