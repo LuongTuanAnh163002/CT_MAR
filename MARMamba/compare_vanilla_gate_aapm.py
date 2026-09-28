@@ -25,6 +25,9 @@ from pathlib import Path
 
 import cv2
 import lpips
+import matplotlib.pyplot as plt
+from matplotlib.colors import LinearSegmentedColormap
+from matplotlib.patches import Rectangle
 import numpy as np
 import torch
 from tqdm.auto import tqdm
@@ -78,10 +81,18 @@ def parse_args():
     )
     parser.add_argument(
         "--top_k",
-        default=3,
+        default=10,
         type=int,
-        help="Number of samples listed for each automatic ranking.",
+        help="Number of candidates retained in auxiliary rankings.",
     )
+    parser.add_argument(
+        "--roi_size",
+        default=96,
+        type=int,
+        help="Square ROI size used to locate and magnify visible differences.",
+    )
+    parser.add_argument("--window_center", default=40.0, type=float)
+    parser.add_argument("--window_width", default=400.0, type=float)
     parser.add_argument(
         "--save_npy",
         action="store_true",
@@ -309,6 +320,15 @@ def ensure_output_directories(output_dir, save_npy):
     for subdirectory in subdirectories:
         (output_dir / "previews" / subdirectory).mkdir(parents=True, exist_ok=True)
 
+    for case_name in (
+        "clear_improvement",
+        "pixel_perceptual_tradeoff",
+        "true_failure",
+    ):
+        (output_dir / "qualitative_cases" / case_name).mkdir(
+            parents=True, exist_ok=True
+        )
+
     if save_npy:
         for subdirectory in ("input", "ground_truth", "vanilla", "coarse_gate"):
             (output_dir / "arrays" / subdirectory).mkdir(parents=True, exist_ok=True)
@@ -388,6 +408,40 @@ def save_case_outputs(
         np.save(array_dir / "coarse_gate" / f"{sample_id}.npy", gate.astype(np.float16))
 
 
+def local_extreme_score(value_map, roi_size, find_max=True):
+    """Return the strongest square-ROI mean and its center coordinate."""
+    height, width = value_map.shape
+    kernel = int(max(8, min(roi_size, height, width)))
+    local_mean = cv2.boxFilter(
+        value_map.astype(np.float32),
+        ddepth=cv2.CV_32F,
+        ksize=(kernel, kernel),
+        normalize=True,
+        borderType=cv2.BORDER_REFLECT,
+    )
+    minimum, maximum, minimum_location, maximum_location = cv2.minMaxLoc(local_mean)
+    if find_max:
+        return float(maximum), (int(maximum_location[0]), int(maximum_location[1]))
+    return float(minimum), (int(minimum_location[0]), int(minimum_location[1]))
+
+
+def pixel_visual_scores(vanilla, gate, target, roi_size):
+    """Positive map means Gate has lower absolute pixel error."""
+    advantage = np.abs(vanilla - target) - np.abs(gate - target)
+    improvement, improvement_center = local_extreme_score(
+        advantage, roi_size, find_max=True
+    )
+    minimum, worsening_center = local_extreme_score(
+        advantage, roi_size, find_max=False
+    )
+    return {
+        "visual_pixel_improvement": improvement,
+        "visual_pixel_worsening": float(-minimum),
+        "pixel_improvement_center": improvement_center,
+        "pixel_worsening_center": worsening_center,
+    }
+
+
 def flatten_entry(entry):
     row = {
         "sample_id": entry["sample_id"],
@@ -400,6 +454,8 @@ def flatten_entry(entry):
         "alpha4": entry["alpha4"],
         "refinement_abs_mean": entry["refinement_abs_mean"],
         "prediction_abs_difference": entry["prediction_abs_difference"],
+        "visual_pixel_improvement": entry["visual_pixel_improvement"],
+        "visual_pixel_worsening": entry["visual_pixel_worsening"],
     }
     for region in REGIONS:
         for metric in METRICS:
@@ -433,6 +489,18 @@ def add_ranking_scores(rows, region):
         for row, score in zip(rows, normalized):
             row[f"z_delta_{metric}"] = float(score)
 
+    visual_improvement_z = z_scores(
+        [row["visual_pixel_improvement"] for row in rows]
+    )
+    visual_worsening_z = z_scores(
+        [row["visual_pixel_worsening"] for row in rows]
+    )
+    for row, improvement_z, worsening_z in zip(
+        rows, visual_improvement_z, visual_worsening_z
+    ):
+        row["z_visual_pixel_improvement"] = float(improvement_z)
+        row["z_visual_pixel_worsening"] = float(worsening_z)
+
     for row in rows:
         row["fidelity_score"] = float(
             np.mean(
@@ -448,6 +516,20 @@ def add_ranking_scores(rows, region):
         )
         row["change_magnitude_score"] = float(
             np.mean([abs(row[f"z_delta_{metric}"]) for metric in METRICS])
+        )
+        row["clear_visual_score"] = float(
+            row["z_delta_psnr"]
+            + 0.50 * row["fidelity_score"]
+            + 0.75 * row["z_visual_pixel_improvement"]
+        )
+        row["tradeoff_visual_score"] = float(
+            -row["z_delta_lpips"]
+            + 0.50 * row["fidelity_score"]
+            + 0.75 * row["z_visual_pixel_improvement"]
+        )
+        row["failure_visual_score"] = float(
+            -row["all_metrics_score"]
+            + 0.75 * row["z_visual_pixel_worsening"]
         )
 
         d_psnr = row[f"{region}_delta_psnr"]
@@ -491,6 +573,11 @@ def compact_case(row, region):
         "fidelity_score": row["fidelity_score"],
         "all_metrics_score": row["all_metrics_score"],
         "change_magnitude_score": row["change_magnitude_score"],
+        "visual_pixel_improvement": row["visual_pixel_improvement"],
+        "visual_pixel_worsening": row["visual_pixel_worsening"],
+        "clear_visual_score": row["clear_visual_score"],
+        "tradeoff_visual_score": row["tradeoff_visual_score"],
+        "failure_visual_score": row["failure_visual_score"],
         "alpha2": row["alpha2"],
         "alpha4": row["alpha4"],
         "alpha_deviation_score": row["alpha_deviation_score"],
@@ -514,6 +601,49 @@ def first_unique(candidates, used_ids):
             used_ids.add(row["sample_id"])
             return row
     return None
+
+
+def select_one_head_two_body(candidates):
+    """Select one head and two body cases, preferring distinct body groups."""
+    heads = [
+        row for row in candidates
+        if str(row["anatomy"]).lower().startswith("head")
+    ]
+    bodies = [
+        row for row in candidates
+        if str(row["anatomy"]).lower().startswith("body")
+    ]
+
+    selected = []
+    if heads:
+        selected.append(heads[0])
+
+    used_anatomies = set()
+    for row in bodies:
+        if row["anatomy"] in used_anatomies:
+            continue
+        selected.append(row)
+        used_anatomies.add(row["anatomy"])
+        if len([item for item in selected if str(item["anatomy"]).lower().startswith("body")]) == 2:
+            break
+
+    selected_body_ids = {
+        row["sample_id"] for row in selected
+        if str(row["anatomy"]).lower().startswith("body")
+    }
+    while len(selected_body_ids) < 2:
+        next_body = next(
+            (
+                row for row in bodies
+                if row["sample_id"] not in selected_body_ids
+            ),
+            None,
+        )
+        if next_body is None:
+            break
+        selected.append(next_body)
+        selected_body_ids.add(next_body["sample_id"])
+    return selected
 
 
 def build_recommendations(rows, region, top_k):
@@ -570,63 +700,85 @@ def build_recommendations(rows, region, top_k):
         top_k,
     )
 
-    # A six-case, non-duplicated proposal for the qualitative figures.
-    used_ids = set()
-    selections = []
-
-    def choose(label, candidates, reason):
-        row = first_unique(candidates, used_ids)
-        if row is not None:
-            selections.append({"role": label, "reason": reason, "case": row})
-
-    choose(
-        "best_fidelity_improvement",
-        top_rows(rows, "fidelity_score", len(rows)),
-        "Strongest joint improvement in PSNR, SSIM, and RMSE.",
-    )
-    choose(
-        "large_metal",
-        top_rows([row for row in rows if row["size_group"] == "Large"], "fidelity_score", len(rows)),
-        "Representative difficult case with a large metal mask.",
-    )
-    choose(
-        "five_metals",
-        top_rows([row for row in rows if int(row["n_materials"]) == 5], "fidelity_score", len(rows)),
-        "Representative case containing five metal objects.",
-    )
-    choose(
-        "pixel_perceptual_tradeoff",
-        sorted(
-            tradeoff_rows,
-            key=lambda row: (row[delta_lpips_key], -row["fidelity_score"]),
-        ),
-        "Pixel metrics improve while LPIPS deteriorates; use as the main limitation case.",
-    )
-    choose(
-        "limited_improvement",
-        top_rows(rows, "change_magnitude_score", len(rows), reverse=False),
-        "Gate and Vanilla are nearly equivalent across the four metrics.",
+    # Three qualitative categories. Each category contains exactly one head
+    # and two body images whenever the dataset provides enough candidates.
+    # Metric strength and local visual saliency are both used for ranking.
+    clear_candidates = [
+        row for row in rows
+        if row[delta_psnr_key] > 0
+        and row[f"{region}_delta_ssim"] > 0
+        and row[f"{region}_delta_rmse"] > 0
+    ]
+    clear_candidates = sorted(
+        clear_candidates,
+        key=lambda row: row["clear_visual_score"],
+        reverse=True,
     )
 
-    challenging_candidates = top_rows(
-        true_failure_rows, "all_metrics_score", len(true_failure_rows), reverse=False
+    tradeoff_candidates = sorted(
+        tradeoff_rows,
+        key=lambda row: row["tradeoff_visual_score"],
+        reverse=True,
     )
-    challenging_label = "true_failure"
-    challenging_reason = "Gate is worse than Vanilla in all four metrics."
-    if not challenging_candidates:
-        challenging_candidates = top_rows(
-            rows, "all_metrics_score", len(rows), reverse=False
+
+    failure_candidates = sorted(
+        true_failure_rows,
+        key=lambda row: row["failure_visual_score"],
+        reverse=True,
+    )
+    failure_is_strict = True
+    if not failure_candidates:
+        failure_is_strict = False
+        failure_candidates = sorted(
+            rows,
+            key=lambda row: row["failure_visual_score"],
+            reverse=True,
         )
-        challenging_label = "worst_observed_case"
-        challenging_reason = (
-            "No strict all-metric failure exists; this is the worst observed "
-            "case by the balanced score."
+
+    qualitative_cases = {
+        "clear_improvement": {
+            "definition": (
+                "Gate improves PSNR, SSIM, and RMSE; selected cases also "
+                "contain a spatially concentrated reduction in pixel error."
+            ),
+            "cases": [
+                compact_case(row, region)
+                for row in select_one_head_two_body(clear_candidates)
+            ],
+        },
+        "pixel_perceptual_tradeoff": {
+            "definition": (
+                "Gate improves PSNR, SSIM, and RMSE while LPIPS worsens."
+            ),
+            "cases": [
+                compact_case(row, region)
+                for row in select_one_head_two_body(tradeoff_candidates)
+            ],
+        },
+        "true_failure": {
+            "definition": (
+                "Gate is worse in all four metrics."
+                if failure_is_strict
+                else "No strict all-metric failures exist; these are the worst observed cases."
+            ),
+            "strict_definition_satisfied": failure_is_strict,
+            "cases": [
+                compact_case(row, region)
+                for row in select_one_head_two_body(failure_candidates)
+            ],
+        },
+    }
+
+    incomplete = {
+        name: len(group["cases"])
+        for name, group in qualitative_cases.items()
+        if len(group["cases"]) != 3
+    }
+    if incomplete:
+        raise RuntimeError(
+            "Cannot construct exactly 1 head + 2 body samples for every "
+            f"qualitative category. Incomplete groups: {incomplete}"
         )
-    choose(
-        challenging_label,
-        challenging_candidates,
-        challenging_reason,
-    )
 
     alpha2_values = np.asarray([row["alpha2"] for row in rows], dtype=np.float64)
     alpha4_values = np.asarray([row["alpha4"] for row in rows], dtype=np.float64)
@@ -665,15 +817,286 @@ def build_recommendations(rows, region, top_k):
             name: [compact_case(row, region) for row in selected]
             for name, selected in rankings.items()
         },
-        "recommended_six_cases": [
-            {
-                "role": item["role"],
-                "reason": item["reason"],
-                **compact_case(item["case"], region),
-            }
-            for item in selections
-        ],
+        "qualitative_cases": qualitative_cases,
     }
+
+
+ADVANTAGE_CMAP = LinearSegmentedColormap.from_list(
+    "gate_advantage", ["#d73027", "#ffffff", "#1a9850"]
+)
+
+
+def read_preview_float(output_dir, kind, sample_id):
+    path = Path(output_dir) / "previews" / kind / f"{sample_id}.png"
+    image = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+    if image is None:
+        raise FileNotFoundError(f"Cannot read preview: {path}")
+    return image.astype(np.float32) / 255.0
+
+
+def ct_window(image_unit, center, width):
+    hu = image_unit * (HU_MAX - HU_MIN) + HU_MIN
+    lower = center - width / 2.0
+    upper = center + width / 2.0
+    return np.clip((hu - lower) / max(upper - lower, 1e-6), 0.0, 1.0)
+
+
+def roi_bounds(center, roi_size, shape):
+    height, width = shape
+    size = int(max(8, min(roi_size, height, width)))
+    x_center, y_center = center
+    x0 = int(np.clip(x_center - size // 2, 0, width - size))
+    y0 = int(np.clip(y_center - size // 2, 0, height - size))
+    return x0, y0, x0 + size, y0 + size
+
+
+def crop_roi(image, bounds):
+    x0, y0, x1, y1 = bounds
+    return image[y0:y1, x0:x1]
+
+
+def normalize_for_joint_display(*maps, percentile=99.0):
+    values = np.concatenate([np.abs(value).ravel() for value in maps])
+    limit = float(np.percentile(values, percentile))
+    return max(limit, 1e-8)
+
+
+@torch.inference_mode()
+def spatial_lpips_advantage(vanilla, gate, target, lpips_spatial_fn, device):
+    target_bgr = to_uint8_bgr3(target)
+    vanilla_bgr = to_uint8_bgr3(vanilla)
+    gate_bgr = to_uint8_bgr3(gate)
+    target_tensor = to_lpips_tensor(target_bgr, device)
+    vanilla_map = lpips_spatial_fn(
+        to_lpips_tensor(vanilla_bgr, device), target_tensor
+    )
+    gate_map = lpips_spatial_fn(
+        to_lpips_tensor(gate_bgr, device), target_tensor
+    )
+    advantage = vanilla_map - gate_map
+    advantage = torch.nn.functional.interpolate(
+        advantage,
+        size=target.shape,
+        mode="bilinear",
+        align_corners=False,
+    )
+    return advantage.squeeze().detach().cpu().numpy().astype(np.float32)
+
+
+def add_roi_rectangle(axis, bounds, color, label=None):
+    x0, y0, x1, y1 = bounds
+    axis.add_patch(
+        Rectangle(
+            (x0, y0),
+            x1 - x0,
+            y1 - y0,
+            fill=False,
+            edgecolor=color,
+            linewidth=2.0,
+        )
+    )
+    if label:
+        axis.text(
+            x0,
+            max(0, y0 - 4),
+            label,
+            color=color,
+            fontsize=8,
+            weight="bold",
+            bbox={"facecolor": "black", "alpha": 0.55, "pad": 1},
+        )
+
+
+def render_qualitative_panel(
+    output_dir,
+    case_name,
+    case,
+    lpips_spatial_fn,
+    device,
+    roi_size,
+    window_center,
+    window_width,
+):
+    sample_id = case["sample_id"]
+    input_image = read_preview_float(output_dir, "input", sample_id)
+    target = read_preview_float(output_dir, "ground_truth", sample_id)
+    vanilla = read_preview_float(output_dir, "vanilla", sample_id)
+    gate = read_preview_float(output_dir, "coarse_gate", sample_id)
+
+    vanilla_error = np.abs(vanilla - target)
+    gate_error = np.abs(gate - target)
+    pixel_advantage = vanilla_error - gate_error
+    lpips_advantage = spatial_lpips_advantage(
+        vanilla, gate, target, lpips_spatial_fn, device
+    )
+
+    _, pixel_good_center = local_extreme_score(
+        pixel_advantage, roi_size, find_max=True
+    )
+    _, pixel_bad_center = local_extreme_score(
+        pixel_advantage, roi_size, find_max=False
+    )
+    _, perceptual_bad_center = local_extreme_score(
+        lpips_advantage, roi_size, find_max=False
+    )
+
+    if case_name == "true_failure":
+        main_center = pixel_bad_center
+        main_color = "#d73027"
+        main_label = "Gate worse"
+    else:
+        main_center = pixel_good_center
+        main_color = "#1a9850"
+        main_label = "Gate better"
+
+    main_bounds = roi_bounds(main_center, roi_size, target.shape)
+    perceptual_bounds = roi_bounds(perceptual_bad_center, roi_size, target.shape)
+
+    display_images = [
+        ct_window(image, window_center, window_width)
+        for image in (input_image, target, vanilla, gate)
+    ]
+    input_display, target_display, vanilla_display, gate_display = display_images
+
+    fig, axes = plt.subplots(2, 6, figsize=(18, 7.4), constrained_layout=True)
+    whole_images = [input_display, target_display, vanilla_display, gate_display]
+    whole_titles = ["Corrupted input", "Ground truth", "Vanilla", "Gate"]
+    for axis, image, title in zip(axes[0, :4], whole_images, whole_titles):
+        axis.imshow(image, cmap="gray", vmin=0, vmax=1)
+        add_roi_rectangle(axis, main_bounds, main_color, "A")
+        if case_name == "pixel_perceptual_tradeoff":
+            add_roi_rectangle(axis, perceptual_bounds, "#d73027", "B")
+        axis.set_title(title)
+        axis.axis("off")
+
+    pixel_limit = normalize_for_joint_display(pixel_advantage)
+    axes[0, 4].imshow(
+        pixel_advantage,
+        cmap=ADVANTAGE_CMAP,
+        vmin=-pixel_limit,
+        vmax=pixel_limit,
+    )
+    axes[0, 4].set_title("Pixel-error advantage\nGreen: Gate better")
+    axes[0, 4].axis("off")
+
+    lpips_limit = normalize_for_joint_display(lpips_advantage)
+    axes[0, 5].imshow(
+        lpips_advantage,
+        cmap=ADVANTAGE_CMAP,
+        vmin=-lpips_limit,
+        vmax=lpips_limit,
+    )
+    axes[0, 5].set_title("Spatial-LPIPS advantage\nRed: Gate worse")
+    axes[0, 5].axis("off")
+
+    for axis, image, title in zip(
+        axes[1, :3],
+        (target_display, vanilla_display, gate_display),
+        ("GT crop A", "Vanilla crop A", "Gate crop A"),
+    ):
+        axis.imshow(crop_roi(image, main_bounds), cmap="gray", vmin=0, vmax=1)
+        axis.set_title(title)
+        axis.axis("off")
+
+    if case_name == "pixel_perceptual_tradeoff":
+        for axis, image, title in zip(
+            axes[1, 3:],
+            (target_display, vanilla_display, gate_display),
+            ("GT crop B", "Vanilla crop B", "Gate crop B"),
+        ):
+            axis.imshow(
+                crop_roi(image, perceptual_bounds), cmap="gray", vmin=0, vmax=1
+            )
+            axis.set_title(title)
+            axis.axis("off")
+    else:
+        error_limit = normalize_for_joint_display(
+            crop_roi(vanilla_error, main_bounds),
+            crop_roi(gate_error, main_bounds),
+        )
+        axes[1, 3].imshow(
+            crop_roi(vanilla_error, main_bounds),
+            cmap="inferno",
+            vmin=0,
+            vmax=error_limit,
+        )
+        axes[1, 3].set_title("Vanilla error crop")
+        axes[1, 4].imshow(
+            crop_roi(gate_error, main_bounds),
+            cmap="inferno",
+            vmin=0,
+            vmax=error_limit,
+        )
+        axes[1, 4].set_title("Gate error crop")
+        axes[1, 5].imshow(
+            crop_roi(pixel_advantage, main_bounds),
+            cmap=ADVANTAGE_CMAP,
+            vmin=-pixel_limit,
+            vmax=pixel_limit,
+        )
+        axes[1, 5].set_title("Pixel advantage crop")
+        for axis in axes[1, 3:]:
+            axis.axis("off")
+
+    metric_text = (
+        f"dPSNR={case['delta_psnr']:+.4f} dB   "
+        f"dSSIM={case['delta_ssim']:+.6f}   "
+        f"dRMSE={case['delta_rmse']:+.4f}   "
+        f"dLPIPS={case['delta_lpips']:+.5f}   "
+        "(positive = Gate better)"
+    )
+    fig.suptitle(
+        f"{case_name.replace('_', ' ').title()} — {sample_id}\n{metric_text}",
+        fontsize=13,
+        weight="bold",
+    )
+    destination = (
+        Path(output_dir) / "qualitative_cases" / case_name / f"{sample_id}.png"
+    )
+    fig.savefig(destination, dpi=220, bbox_inches="tight")
+    plt.close(fig)
+    return {
+        "sample_id": sample_id,
+        "panel": str(destination),
+        "main_roi_xyxy": list(main_bounds),
+        "perceptual_roi_xyxy": (
+            list(perceptual_bounds)
+            if case_name == "pixel_perceptual_tradeoff"
+            else None
+        ),
+    }
+
+
+def render_selected_cases(
+    output_dir,
+    recommendations,
+    device,
+    roi_size,
+    window_center,
+    window_width,
+):
+    print("Loading spatial LPIPS for qualitative panels...")
+    lpips_spatial_fn = lpips.LPIPS(net="vgg", spatial=True).to(device).eval()
+    for parameter in lpips_spatial_fn.parameters():
+        parameter.requires_grad_(False)
+
+    rendered = {}
+    for case_name, group in recommendations["qualitative_cases"].items():
+        rendered[case_name] = []
+        for case in group["cases"]:
+            rendered[case_name].append(
+                render_qualitative_panel(
+                    output_dir,
+                    case_name,
+                    case,
+                    lpips_spatial_fn,
+                    device,
+                    roi_size,
+                    window_center,
+                    window_width,
+                )
+            )
+    return rendered
 
 
 def summarize_overall(rows):
@@ -708,16 +1131,20 @@ def summarize_overall(rows):
 
 def print_recommendations(recommendations):
     region = recommendations["ranking_region"]
-    print(f"\n=== RECOMMENDED CASES ({region}) ===")
-    for item in recommendations["recommended_six_cases"]:
-        print(
-            f"{item['role']:>14}: {item['sample_id']} | "
-            f"count={item['n_materials']} size={item['size_group']} | "
-            f"dPSNR={item['delta_psnr']:+.4f} "
-            f"dSSIM={item['delta_ssim']:+.6f} "
-            f"dRMSE={item['delta_rmse']:+.4f} "
-            f"dLPIPS={item['delta_lpips']:+.5f}"
-        )
+    print(f"\n=== THREE QUALITATIVE CASE GROUPS ({region}) ===")
+    for case_name, group in recommendations["qualitative_cases"].items():
+        print(f"\n[{case_name}] {group['definition']}")
+        if not group["cases"]:
+            print("  No eligible cases.")
+        for index, item in enumerate(group["cases"], 1):
+            print(
+                f"  {index}. {item['sample_id']} ({item['anatomy']}) | "
+                f"count={item['n_materials']} size={item['size_group']} | "
+                f"dPSNR={item['delta_psnr']:+.4f} "
+                f"dSSIM={item['delta_ssim']:+.6f} "
+                f"dRMSE={item['delta_rmse']:+.4f} "
+                f"dLPIPS={item['delta_lpips']:+.5f}"
+            )
 
     print("\n=== TOP DELTA PSNR ===")
     for rank, item in enumerate(recommendations["rankings"]["top_delta_psnr"], 1):
@@ -755,6 +1182,10 @@ def main():
         raise ValueError("--top_k must be positive.")
     if args.error_max <= 0:
         raise ValueError("--error_max must be positive.")
+    if args.roi_size <= 0:
+        raise ValueError("--roi_size must be positive.")
+    if args.window_width <= 0:
+        raise ValueError("--window_width must be positive.")
 
     if args.device.startswith("cuda") and not torch.cuda.is_available():
         print("CUDA is unavailable; using CPU.")
@@ -842,6 +1273,14 @@ def main():
                 "refinement_abs_mean": float(refinement_tensor.abs().mean().item()),
                 "prediction_abs_difference": float(np.abs(gate - vanilla).mean()),
             }
+            entry.update(
+                pixel_visual_scores(
+                    vanilla,
+                    gate,
+                    target,
+                    args.roi_size,
+                )
+            )
 
             for exclude_metal, region in (
                 (True, "non_metal"),
@@ -878,6 +1317,20 @@ def main():
         rows, args.ranking_region, min(args.top_k, len(rows))
     )
 
+    del lpips_fn
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    rendered_panels = render_selected_cases(
+        output_dir,
+        recommendations,
+        device,
+        args.roi_size,
+        args.window_center,
+        args.window_width,
+    )
+    recommendations["rendered_panels"] = rendered_panels
+
     write_csv(rows, output_dir / "per_image_metrics_and_deltas.csv")
     with open(output_dir / "per_image_details.json", "w", encoding="utf-8") as file:
         json.dump(entries, file, indent=2, ensure_ascii=False)
@@ -903,6 +1356,7 @@ def main():
     print(f"\nSaved CSV: {output_dir / 'per_image_metrics_and_deltas.csv'}")
     print(f"Saved recommendations: {output_dir / 'recommendations.json'}")
     print(f"Saved previews: {output_dir / 'previews'}")
+    print(f"Saved qualitative panels: {output_dir / 'qualitative_cases'}")
 
 
 if __name__ == "__main__":
