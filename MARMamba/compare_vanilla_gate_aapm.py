@@ -470,9 +470,27 @@ def local_extreme_score(
         )
         allowed = valid_fraction >= float(min_valid_fraction)
         if not np.any(allowed):
-            raise RuntimeError(
-                "No valid anatomical ROI was found. Reduce --roi_size."
-            )
+            # Small head/body cross-sections, anatomy near an image boundary,
+            # or an imperfect HU foreground mask may make it impossible for a
+            # fixed-size ROI to reach the requested coverage. Do not abort the
+            # complete evaluation for one such sample. Instead, retain ROIs
+            # whose anatomical coverage is close to the best coverage that is
+            # actually attainable for this image.
+            maximum_valid_fraction = float(np.max(valid_fraction))
+            if maximum_valid_fraction > 0.0:
+                adaptive_fraction = max(
+                    0.05,
+                    min(
+                        float(min_valid_fraction),
+                        0.90 * maximum_valid_fraction,
+                    ),
+                )
+                allowed = valid_fraction >= adaptive_fraction
+            else:
+                # Last-resort fallback for a completely empty/invalid anatomy
+                # mask. This keeps evaluation running; the extremum is then
+                # selected from the complete image.
+                allowed = np.ones_like(valid_fraction, dtype=bool)
         local_mean = local_mean.copy()
         local_mean[~allowed] = -np.inf if find_max else np.inf
 
