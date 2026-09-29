@@ -414,7 +414,15 @@ def save_case_outputs(
 def anatomical_valid_mask(target_unit):
     """Approximate the patient cross-section and exclude surrounding air."""
     target_hu = target_unit * (HU_MAX - HU_MIN) + HU_MIN
-    foreground = (target_hu > -950.0).astype(np.uint8)
+    # A stricter threshold than -950 HU avoids retaining scanner/table lines
+    # and weak non-anatomical background variations.
+    foreground = (target_hu > -700.0).astype(np.uint8)
+    foreground = cv2.morphologyEx(
+        foreground,
+        cv2.MORPH_OPEN,
+        np.ones((5, 5), dtype=np.uint8),
+        iterations=1,
+    )
     foreground = cv2.morphologyEx(
         foreground,
         cv2.MORPH_CLOSE,
@@ -442,12 +450,40 @@ def anatomical_valid_mask(target_unit):
     return filled.astype(bool)
 
 
+def near_metal_center_mask(
+    body_mask,
+    metal_mask,
+    inner_radius=3,
+    outer_radius=64,
+):
+    """Return non-metal anatomical pixels in a band around the metal mask."""
+    body_mask = body_mask.astype(bool)
+    if metal_mask is None or not np.any(metal_mask):
+        return body_mask.copy()
+
+    metal_u8 = metal_mask.astype(np.uint8)
+    inner_size = max(1, 2 * int(inner_radius) + 1)
+    outer_size = max(inner_size + 2, 2 * int(outer_radius) + 1)
+    inner = cv2.dilate(
+        metal_u8,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (inner_size, inner_size)),
+    ).astype(bool)
+    outer = cv2.dilate(
+        metal_u8,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (outer_size, outer_size)),
+    ).astype(bool)
+    band = outer & ~inner
+    centers = body_mask & band & ~metal_mask.astype(bool)
+    return centers if np.any(centers) else body_mask.copy()
+
+
 def local_extreme_score(
     value_map,
     roi_size,
     find_max=True,
     valid_mask=None,
-    min_valid_fraction=0.60,
+    min_valid_fraction=0.70,
+    center_mask=None,
 ):
     """Return the strongest square-ROI mean and its center coordinate."""
     height, width = value_map.shape
@@ -469,6 +505,8 @@ def local_extreme_score(
             borderType=cv2.BORDER_CONSTANT,
         )
         allowed = valid_fraction >= float(min_valid_fraction)
+        if center_mask is not None:
+            allowed &= center_mask.astype(bool)
         if not np.any(allowed):
             # Small head/body cross-sections, anatomy near an image boundary,
             # or an imperfect HU foreground mask may make it impossible for a
@@ -486,6 +524,16 @@ def local_extreme_score(
                     ),
                 )
                 allowed = valid_fraction >= adaptive_fraction
+                if center_mask is not None:
+                    allowed &= center_mask.astype(bool)
+                if not np.any(allowed):
+                    # Near-metal selection is preferred, but a valid
+                    # anatomical center is safer than aborting or selecting
+                    # background when that band is too small for this slice.
+                    allowed = (
+                        (valid_fraction >= adaptive_fraction)
+                        & valid_mask.astype(bool)
+                    )
             else:
                 # Last-resort fallback for a completely empty/invalid anatomy
                 # mask. This keeps evaluation running; the extremum is then
@@ -500,21 +548,24 @@ def local_extreme_score(
     return float(minimum), (int(minimum_location[0]), int(minimum_location[1]))
 
 
-def pixel_visual_scores(vanilla, gate, target, roi_size):
+def pixel_visual_scores(vanilla, gate, target, metal_mask, roi_size):
     """Positive map means Gate has lower absolute pixel error."""
     advantage = np.abs(vanilla - target) - np.abs(gate - target)
     valid_mask = anatomical_valid_mask(target)
+    center_mask = near_metal_center_mask(valid_mask, metal_mask)
     improvement, improvement_center = local_extreme_score(
         advantage,
         roi_size,
         find_max=True,
         valid_mask=valid_mask,
+        center_mask=center_mask,
     )
     minimum, worsening_center = local_extreme_score(
         advantage,
         roi_size,
         find_max=False,
         valid_mask=valid_mask,
+        center_mask=center_mask,
     )
     return {
         "visual_pixel_improvement": improvement,
@@ -538,6 +589,10 @@ def flatten_entry(entry):
         "prediction_abs_difference": entry["prediction_abs_difference"],
         "visual_pixel_improvement": entry["visual_pixel_improvement"],
         "visual_pixel_worsening": entry["visual_pixel_worsening"],
+        "pixel_improvement_center_x": int(entry["pixel_improvement_center"][0]),
+        "pixel_improvement_center_y": int(entry["pixel_improvement_center"][1]),
+        "pixel_worsening_center_x": int(entry["pixel_worsening_center"][0]),
+        "pixel_worsening_center_y": int(entry["pixel_worsening_center"][1]),
     }
     for region in REGIONS:
         for metric in METRICS:
@@ -657,6 +712,14 @@ def compact_case(row, region):
         "change_magnitude_score": row["change_magnitude_score"],
         "visual_pixel_improvement": row["visual_pixel_improvement"],
         "visual_pixel_worsening": row["visual_pixel_worsening"],
+        "pixel_improvement_center": [
+            int(row["pixel_improvement_center_x"]),
+            int(row["pixel_improvement_center_y"]),
+        ],
+        "pixel_worsening_center": [
+            int(row["pixel_worsening_center_x"]),
+            int(row["pixel_worsening_center_y"]),
+        ],
         "clear_visual_score": row["clear_visual_score"],
         "tradeoff_visual_score": row["tradeoff_visual_score"],
         "failure_visual_score": row["failure_visual_score"],
@@ -943,6 +1006,64 @@ def normalize_for_joint_display(*maps, percentile=99.0):
     return max(limit, 1e-8)
 
 
+def find_joint_tradeoff_roi(
+    pixel_advantage,
+    lpips_advantage,
+    roi_size,
+    body_mask,
+    center_mask,
+    min_body_fraction=0.70,
+):
+    """Find one ROI with pixel gain and perceptual degradation.
+
+    Returns (center, is_joint). If no co-localized trade-off exists, center is
+    None and the caller may fall back to two separate ROIs.
+    """
+    height, width = pixel_advantage.shape
+    kernel = int(max(8, min(roi_size, height, width)))
+    kwargs = dict(
+        ddepth=cv2.CV_32F,
+        ksize=(kernel, kernel),
+        normalize=True,
+        borderType=cv2.BORDER_REFLECT,
+    )
+    pixel_local = cv2.boxFilter(pixel_advantage.astype(np.float32), **kwargs)
+    lpips_local = cv2.boxFilter(lpips_advantage.astype(np.float32), **kwargs)
+    body_fraction = cv2.boxFilter(
+        body_mask.astype(np.float32),
+        ddepth=cv2.CV_32F,
+        ksize=(kernel, kernel),
+        normalize=True,
+        borderType=cv2.BORDER_CONSTANT,
+    )
+
+    allowed = (
+        (body_fraction >= float(min_body_fraction))
+        & body_mask.astype(bool)
+        & center_mask.astype(bool)
+    )
+    if not np.any(allowed):
+        allowed = (body_fraction >= 0.50) & body_mask.astype(bool)
+
+    candidates = allowed & (pixel_local > 0.0) & (lpips_local < 0.0)
+    if not np.any(candidates):
+        return None, False
+
+    pixel_scale = max(
+        float(np.percentile(np.abs(pixel_local[allowed]), 95.0)), 1e-8
+    )
+    lpips_scale = max(
+        float(np.percentile(np.abs(lpips_local[allowed]), 95.0)), 1e-8
+    )
+    joint_score = pixel_local / pixel_scale + (-lpips_local) / lpips_scale
+    joint_score = joint_score.astype(np.float32)
+    joint_score[~candidates] = -np.inf
+    _, maximum, _, location = cv2.minMaxLoc(joint_score)
+    if not np.isfinite(maximum):
+        return None, False
+    return (int(location[0]), int(location[1])), True
+
+
 @torch.inference_mode()
 def spatial_lpips_advantage(vanilla, gate, target, lpips_spatial_fn, device):
     target_bgr = to_uint8_bgr3(target)
@@ -1004,11 +1125,15 @@ def render_qualitative_panel(
     target = read_preview_float(output_dir, "ground_truth", sample_id)
     vanilla = read_preview_float(output_dir, "vanilla", sample_id)
     gate = read_preview_float(output_dir, "coarse_gate", sample_id)
+    metal_mask = (
+        read_preview_float(output_dir, "metal_mask", sample_id) > 0.5
+    )
 
     vanilla_error = np.abs(vanilla - target)
     gate_error = np.abs(gate - target)
     pixel_advantage = vanilla_error - gate_error
     valid_mask = anatomical_valid_mask(target)
+    center_mask = near_metal_center_mask(valid_mask, metal_mask)
     lpips_advantage = spatial_lpips_advantage(
         vanilla, gate, target, lpips_spatial_fn, device
     )
@@ -1018,28 +1143,52 @@ def render_qualitative_panel(
         roi_size,
         find_max=True,
         valid_mask=valid_mask,
+        center_mask=center_mask,
     )
     _, pixel_bad_center = local_extreme_score(
         pixel_advantage,
         roi_size,
         find_max=False,
         valid_mask=valid_mask,
+        center_mask=center_mask,
     )
     _, perceptual_bad_center = local_extreme_score(
         lpips_advantage,
         roi_size,
         find_max=False,
         valid_mask=valid_mask,
+        center_mask=center_mask,
     )
 
     if case_name == "true_failure":
-        main_center = pixel_bad_center
+        main_center = tuple(case.get("pixel_worsening_center", pixel_bad_center))
         main_color = "#d73027"
         main_label = "Gate worse"
+        joint_tradeoff = False
+    elif case_name == "pixel_perceptual_tradeoff":
+        joint_center, joint_tradeoff = find_joint_tradeoff_roi(
+            pixel_advantage,
+            lpips_advantage,
+            roi_size,
+            valid_mask,
+            center_mask,
+        )
+        if joint_tradeoff:
+            main_center = joint_center
+            perceptual_bad_center = joint_center
+            main_color = "#8e5eac"
+            main_label = "Pixel gain / LPIPS loss"
+        else:
+            main_center = tuple(
+                case.get("pixel_improvement_center", pixel_good_center)
+            )
+            main_color = "#1a9850"
+            main_label = "Gate better"
     else:
-        main_center = pixel_good_center
+        main_center = tuple(case.get("pixel_improvement_center", pixel_good_center))
         main_color = "#1a9850"
         main_label = "Gate better"
+        joint_tradeoff = False
 
     main_bounds = roi_bounds(main_center, roi_size, target.shape)
     perceptual_bounds = roi_bounds(perceptual_bad_center, roi_size, target.shape)
@@ -1056,7 +1205,7 @@ def render_qualitative_panel(
     for axis, image, title in zip(axes[0, :4], whole_images, whole_titles):
         axis.imshow(image, cmap="gray", vmin=0, vmax=1)
         add_roi_rectangle(axis, main_bounds, main_color, "A")
-        if case_name == "pixel_perceptual_tradeoff":
+        if case_name == "pixel_perceptual_tradeoff" and not joint_tradeoff:
             add_roi_rectangle(axis, perceptual_bounds, "#d73027", "B")
         axis.set_title(title)
         axis.axis("off")
@@ -1077,7 +1226,11 @@ def render_qualitative_panel(
         pixel_map_limit = normalize_for_joint_display(pixel_map_to_show)
         lpips_map_limit = normalize_for_joint_display(lpips_map_to_show)
         pixel_map_title = "Pixel-error advantage crop A\nGreen: Gate better"
-        lpips_map_title = "Spatial-LPIPS advantage crop B\nRed: Gate worse"
+        lpips_map_title = (
+            "Spatial-LPIPS advantage crop A\nRed: Gate worse"
+            if joint_tradeoff
+            else "Spatial-LPIPS advantage crop B\nRed: Gate worse"
+        )
     else:
         pixel_map_to_show = pixel_advantage_display
         lpips_map_to_show = lpips_advantage
@@ -1113,7 +1266,7 @@ def render_qualitative_panel(
         axis.set_title(title)
         axis.axis("off")
 
-    if case_name == "pixel_perceptual_tradeoff":
+    if case_name == "pixel_perceptual_tradeoff" and not joint_tradeoff:
         for axis, image, title in zip(
             axes[1, 3:],
             (target_display, vanilla_display, gate_display),
@@ -1123,6 +1276,34 @@ def render_qualitative_panel(
                 crop_roi(image, perceptual_bounds), cmap="gray", vmin=0, vmax=1
             )
             axis.set_title(title)
+            axis.axis("off")
+    elif case_name == "pixel_perceptual_tradeoff":
+        error_limit = normalize_for_joint_display(
+            crop_roi(vanilla_error, main_bounds),
+            crop_roi(gate_error, main_bounds),
+        )
+        axes[1, 3].imshow(
+            crop_roi(vanilla_error, main_bounds),
+            cmap="inferno",
+            vmin=0,
+            vmax=error_limit,
+        )
+        axes[1, 3].set_title("Vanilla error crop A")
+        axes[1, 4].imshow(
+            crop_roi(gate_error, main_bounds),
+            cmap="inferno",
+            vmin=0,
+            vmax=error_limit,
+        )
+        axes[1, 4].set_title("Gate error crop A")
+        axes[1, 5].imshow(
+            crop_roi(lpips_advantage, main_bounds),
+            cmap=ADVANTAGE_CMAP,
+            vmin=-lpips_map_limit,
+            vmax=lpips_map_limit,
+        )
+        axes[1, 5].set_title("LPIPS advantage crop A")
+        for axis in axes[1, 3:]:
             axis.axis("off")
     else:
         error_limit = normalize_for_joint_display(
@@ -1179,6 +1360,7 @@ def render_qualitative_panel(
             if case_name == "pixel_perceptual_tradeoff"
             else None
         ),
+        "joint_tradeoff_roi": bool(joint_tradeoff),
     }
 
 
@@ -1393,6 +1575,7 @@ def main():
                     vanilla,
                     gate,
                     target,
+                    mask,
                     args.roi_size,
                 )
             )
