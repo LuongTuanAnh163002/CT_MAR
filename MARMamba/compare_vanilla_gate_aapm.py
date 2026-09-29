@@ -325,9 +325,12 @@ def ensure_output_directories(output_dir, save_npy):
         "pixel_perceptual_tradeoff",
         "true_failure",
     ):
-        (output_dir / "qualitative_cases" / case_name).mkdir(
-            parents=True, exist_ok=True
-        )
+        case_dir = output_dir / "qualitative_cases" / case_name
+        case_dir.mkdir(parents=True, exist_ok=True)
+        # Remove panels from a previous run so obsolete selections are not
+        # mistaken for current recommendations.
+        for old_panel in case_dir.glob("*.png"):
+            old_panel.unlink()
 
     if save_npy:
         for subdirectory in ("input", "ground_truth", "vanilla", "coarse_gate"):
@@ -408,7 +411,44 @@ def save_case_outputs(
         np.save(array_dir / "coarse_gate" / f"{sample_id}.npy", gate.astype(np.float16))
 
 
-def local_extreme_score(value_map, roi_size, find_max=True):
+def anatomical_valid_mask(target_unit):
+    """Approximate the patient cross-section and exclude surrounding air."""
+    target_hu = target_unit * (HU_MAX - HU_MIN) + HU_MIN
+    foreground = (target_hu > -950.0).astype(np.uint8)
+    foreground = cv2.morphologyEx(
+        foreground,
+        cv2.MORPH_CLOSE,
+        np.ones((9, 9), dtype=np.uint8),
+        iterations=2,
+    )
+
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(
+        foreground, connectivity=8
+    )
+    if count <= 1:
+        return foreground.astype(bool)
+
+    # The patient cross-section is normally the largest non-air component.
+    largest_label = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+    patient = (labels == largest_label).astype(np.uint8)
+
+    # Fill internal holes (e.g. lungs) so valid ROIs may cover all anatomy.
+    contours, _ = cv2.findContours(
+        patient, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+    filled = np.zeros_like(patient)
+    if contours:
+        cv2.drawContours(filled, contours, -1, color=1, thickness=cv2.FILLED)
+    return filled.astype(bool)
+
+
+def local_extreme_score(
+    value_map,
+    roi_size,
+    find_max=True,
+    valid_mask=None,
+    min_valid_fraction=0.60,
+):
     """Return the strongest square-ROI mean and its center coordinate."""
     height, width = value_map.shape
     kernel = int(max(8, min(roi_size, height, width)))
@@ -419,6 +459,23 @@ def local_extreme_score(value_map, roi_size, find_max=True):
         normalize=True,
         borderType=cv2.BORDER_REFLECT,
     )
+
+    if valid_mask is not None:
+        valid_fraction = cv2.boxFilter(
+            valid_mask.astype(np.float32),
+            ddepth=cv2.CV_32F,
+            ksize=(kernel, kernel),
+            normalize=True,
+            borderType=cv2.BORDER_CONSTANT,
+        )
+        allowed = valid_fraction >= float(min_valid_fraction)
+        if not np.any(allowed):
+            raise RuntimeError(
+                "No valid anatomical ROI was found. Reduce --roi_size."
+            )
+        local_mean = local_mean.copy()
+        local_mean[~allowed] = -np.inf if find_max else np.inf
+
     minimum, maximum, minimum_location, maximum_location = cv2.minMaxLoc(local_mean)
     if find_max:
         return float(maximum), (int(maximum_location[0]), int(maximum_location[1]))
@@ -428,11 +485,18 @@ def local_extreme_score(value_map, roi_size, find_max=True):
 def pixel_visual_scores(vanilla, gate, target, roi_size):
     """Positive map means Gate has lower absolute pixel error."""
     advantage = np.abs(vanilla - target) - np.abs(gate - target)
+    valid_mask = anatomical_valid_mask(target)
     improvement, improvement_center = local_extreme_score(
-        advantage, roi_size, find_max=True
+        advantage,
+        roi_size,
+        find_max=True,
+        valid_mask=valid_mask,
     )
     minimum, worsening_center = local_extreme_score(
-        advantage, roi_size, find_max=False
+        advantage,
+        roi_size,
+        find_max=False,
+        valid_mask=valid_mask,
     )
     return {
         "visual_pixel_improvement": improvement,
@@ -926,18 +990,28 @@ def render_qualitative_panel(
     vanilla_error = np.abs(vanilla - target)
     gate_error = np.abs(gate - target)
     pixel_advantage = vanilla_error - gate_error
+    valid_mask = anatomical_valid_mask(target)
     lpips_advantage = spatial_lpips_advantage(
         vanilla, gate, target, lpips_spatial_fn, device
     )
 
     _, pixel_good_center = local_extreme_score(
-        pixel_advantage, roi_size, find_max=True
+        pixel_advantage,
+        roi_size,
+        find_max=True,
+        valid_mask=valid_mask,
     )
     _, pixel_bad_center = local_extreme_score(
-        pixel_advantage, roi_size, find_max=False
+        pixel_advantage,
+        roi_size,
+        find_max=False,
+        valid_mask=valid_mask,
     )
     _, perceptual_bad_center = local_extreme_score(
-        lpips_advantage, roi_size, find_max=False
+        lpips_advantage,
+        roi_size,
+        find_max=False,
+        valid_mask=valid_mask,
     )
 
     if case_name == "true_failure":
@@ -969,24 +1043,47 @@ def render_qualitative_panel(
         axis.set_title(title)
         axis.axis("off")
 
-    pixel_limit = normalize_for_joint_display(pixel_advantage)
-    axes[0, 4].imshow(
-        pixel_advantage,
-        cmap=ADVANTAGE_CMAP,
-        vmin=-pixel_limit,
-        vmax=pixel_limit,
+    pixel_advantage_display = cv2.GaussianBlur(
+        pixel_advantage.astype(np.float32), (0, 0), sigmaX=1.2
     )
-    axes[0, 4].set_title("Pixel-error advantage\nGreen: Gate better")
+    pixel_limit = normalize_for_joint_display(pixel_advantage_display)
+    lpips_limit = normalize_for_joint_display(lpips_advantage)
+
+    if case_name == "pixel_perceptual_tradeoff":
+        # For a trade-off example, focus the two diagnostic maps on the
+        # regions that define the trade-off instead of showing whole slices:
+        # A is the strongest pixel-fidelity gain and B is the strongest
+        # perceptual degradation.
+        pixel_map_to_show = crop_roi(pixel_advantage_display, main_bounds)
+        lpips_map_to_show = crop_roi(lpips_advantage, perceptual_bounds)
+        pixel_map_limit = normalize_for_joint_display(pixel_map_to_show)
+        lpips_map_limit = normalize_for_joint_display(lpips_map_to_show)
+        pixel_map_title = "Pixel-error advantage crop A\nGreen: Gate better"
+        lpips_map_title = "Spatial-LPIPS advantage crop B\nRed: Gate worse"
+    else:
+        pixel_map_to_show = pixel_advantage_display
+        lpips_map_to_show = lpips_advantage
+        pixel_map_limit = pixel_limit
+        lpips_map_limit = lpips_limit
+        pixel_map_title = "Pixel-error advantage (smoothed)\nGreen: Gate better"
+        lpips_map_title = "Spatial-LPIPS advantage\nRed: Gate worse"
+
+    axes[0, 4].imshow(
+        pixel_map_to_show,
+        cmap=ADVANTAGE_CMAP,
+        vmin=-pixel_map_limit,
+        vmax=pixel_map_limit,
+    )
+    axes[0, 4].set_title(pixel_map_title)
     axes[0, 4].axis("off")
 
-    lpips_limit = normalize_for_joint_display(lpips_advantage)
     axes[0, 5].imshow(
-        lpips_advantage,
+        lpips_map_to_show,
         cmap=ADVANTAGE_CMAP,
-        vmin=-lpips_limit,
-        vmax=lpips_limit,
+        vmin=-lpips_map_limit,
+        vmax=lpips_map_limit,
     )
-    axes[0, 5].set_title("Spatial-LPIPS advantage\nRed: Gate worse")
+    axes[0, 5].set_title(lpips_map_title)
     axes[0, 5].axis("off")
 
     for axis, image, title in zip(
@@ -1029,7 +1126,7 @@ def render_qualitative_panel(
         )
         axes[1, 4].set_title("Gate error crop")
         axes[1, 5].imshow(
-            crop_roi(pixel_advantage, main_bounds),
+            crop_roi(pixel_advantage_display, main_bounds),
             cmap=ADVANTAGE_CMAP,
             vmin=-pixel_limit,
             vmax=pixel_limit,
