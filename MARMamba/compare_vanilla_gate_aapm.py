@@ -1,5 +1,5 @@
 """Paired inference, per-image evaluation, and case recommendation.
-File for compare visualize
+File for compare visualize with vanila and coarse gate
 This script evaluates an independently trained vanilla MARMamba checkpoint and
 a Dynamic-Gated Multi-Scale Coarse checkpoint on exactly the same AAPM samples.
 It writes per-image metrics/deltas, saves qualitative previews, and recommends
