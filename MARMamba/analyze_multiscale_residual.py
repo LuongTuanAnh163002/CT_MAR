@@ -59,19 +59,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bootstrap", type=int, default=10000)
     parser.add_argument("--seed", type=int, default=19)
     parser.add_argument(
-        "--representative-percentiles",
+        "--figure-cases",
+        type=int,
+        default=3,
+        help="Number of high-energy joint scale-2/scale-4 cases to visualize (default: 3).",
+    )
+    parser.add_argument(
+        "--selection-top-fraction",
         type=float,
-        nargs="+",
-        default=[25.0, 50.0, 75.0],
-        help="Percentiles used to select representative multiscale cases.",
+        default=0.20,
+        help=(
+            "Select figure candidates from the intersection of the top fraction "
+            "at both scale 2 and scale 4 (default: 0.20)."
+        ),
     )
     args = parser.parse_args()
     if args.mask_erode < 0:
         parser.error("--mask-erode must be non-negative")
     if not 0.0 < args.significant_energy < 1.0:
         parser.error("--significant-energy must be between 0 and 1")
-    if any(p < 0.0 or p > 100.0 for p in args.representative_percentiles):
-        parser.error("Representative percentiles must be in [0,100]")
+    if args.figure_cases < 1:
+        parser.error("--figure-cases must be at least 1")
+    if not 0.0 < args.selection_top_fraction <= 1.0:
+        parser.error("--selection-top-fraction must be in (0,1]")
     return args
 
 
@@ -176,35 +186,68 @@ def summarize(
     }
 
 
-def representative_indices(records: list[dict], percentiles: list[float]) -> list[int]:
-    # Balance score is high only if both modeled scales carry non-trivial energy.
-    scores = np.asarray(
-        [min(float(r["energy_ratio_scale4"]), float(r["energy_ratio_scale2"])) for r in records]
+def percentile_ranks(values: np.ndarray) -> np.ndarray:
+    """Return deterministic percentile ranks in (0, 1]."""
+    order = np.argsort(values, kind="mergesort")
+    ranks = np.empty(len(values), dtype=np.float64)
+    ranks[order] = (np.arange(len(values), dtype=np.float64) + 1.0) / len(values)
+    return ranks
+
+
+def select_joint_high_energy_indices(
+    records: list[dict], number: int, top_fraction: float
+) -> tuple[list[int], float, float]:
+    """Select cases that are simultaneously high at scale 2 and scale 4.
+
+    Candidates must lie in the top ``top_fraction`` independently for both
+    component-energy ratios. They are ranked by the smaller of the two
+    percentile ranks, so a very large value at one scale cannot compensate for
+    a weak value at the other scale.
+    """
+    scale2 = np.asarray([float(r["energy_ratio_scale2"]) for r in records])
+    scale4 = np.asarray([float(r["energy_ratio_scale4"]) for r in records])
+    q = 1.0 - top_fraction
+    threshold2 = float(np.quantile(scale2, q))
+    threshold4 = float(np.quantile(scale4, q))
+    rank2 = percentile_ranks(scale2)
+    rank4 = percentile_ranks(scale4)
+    joint_rank = np.minimum(rank2, rank4)
+
+    candidates = np.flatnonzero((scale2 >= threshold2) & (scale4 >= threshold4))
+    if len(candidates) < number:
+        print(
+            "Warning: fewer joint top-fraction cases than requested; "
+            "falling back to the highest balanced joint ranks."
+        )
+        candidates = np.arange(len(records))
+    ordered = candidates[np.argsort(-joint_rank[candidates], kind="mergesort")]
+    return [int(i) for i in ordered[:number]], threshold2, threshold4
+
+
+def normalize_component_for_display(array: np.ndarray, mask: np.ndarray) -> tuple[np.ndarray, float]:
+    """Independently scale a signed component by its in-mask 99th percentile."""
+    valid = np.abs(array[mask])
+    limit = float(np.percentile(valid, 99.0)) if valid.size else 0.0
+    limit = max(limit, 1e-8)
+    shown = np.clip(array / limit, -1.0, 1.0)
+    return np.where(mask, shown, np.nan), limit
+
+
+def save_decomposition_figure(
+    records: list[dict], path: Path, number: int, top_fraction: float
+) -> dict[str, object]:
+    chosen_indices, threshold2, threshold4 = select_joint_high_energy_indices(
+        records, number, top_fraction
     )
-    chosen: list[int] = []
-    for percentile in percentiles:
-        target = float(np.percentile(scores, percentile))
-        order = np.argsort(np.abs(scores - target))
-        index = next(int(i) for i in order if int(i) not in chosen)
-        chosen.append(index)
-    return chosen
-
-
-def save_decomposition_figure(records: list[dict], path: Path, percentiles: list[float]) -> None:
-    chosen_indices = representative_indices(records, percentiles)
     chosen = [records[i] for i in chosen_indices]
     columns = ["Ground truth", "Stage 2", "Residual $r$", "Scale-4 $c_4$", "Scale-2 $c_2$", "Fine $c_f$"]
-    fig, axes = plt.subplots(len(chosen), len(columns), figsize=(16, 3.0 * len(chosen)), squeeze=False)
+    fig, axes = plt.subplots(len(chosen), len(columns), figsize=(16, 3.15 * len(chosen)), squeeze=False)
     for col, title in enumerate(columns):
         axes[0, col].set_title(title, fontsize=11)
 
-    residual_images = []
-    for record in chosen:
-        residual_images.extend([record["residual"], record["scale4"], record["scale2"], record["fine"]])
-    limit = max(float(np.percentile(np.abs(x), 99.5)) for x in residual_images)
-    limit = max(limit, 1e-8)
     mappable = None
-    for row, (record, percentile) in enumerate(zip(chosen, percentiles)):
+    selected_metadata = []
+    for row, record in enumerate(chosen):
         panels = [
             record["gt"], record["stage2"], record["residual"],
             record["scale4"], record["scale2"], record["fine"],
@@ -214,18 +257,58 @@ def save_decomposition_figure(records: list[dict], path: Path, percentiles: list
             if col < 2:
                 ax.imshow(panel, cmap="gray", vmin=0.0, vmax=1.0)
             else:
-                mappable = ax.imshow(panel, cmap="coolwarm", vmin=-limit, vmax=limit)
+                shown, display_limit = normalize_component_for_display(panel, record["mask"])
+                mappable = ax.imshow(shown, cmap="coolwarm", vmin=-1.0, vmax=1.0)
+                if col == 2:
+                    ax.set_xlabel(f"99% |value|={display_limit:.2e}", fontsize=7)
             ax.axis("off")
         axes[row, 0].set_ylabel(
-            f"P{percentile:g}\n{record['sample_id']}", fontsize=9
+            f"{record['sample_id']}\n"
+            f"$E_4/E_r$={100.0 * float(record['energy_ratio_scale4']):.1f}%\n"
+            f"$E_2/E_r$={100.0 * float(record['energy_ratio_scale2']):.1f}%\n"
+            f"$E_f/E_r$={100.0 * float(record['energy_ratio_fine']):.1f}%",
+            fontsize=8,
+        )
+        selected_metadata.append(
+            {
+                "sample_id": str(record["sample_id"]),
+                "energy_ratio_scale4": float(record["energy_ratio_scale4"]),
+                "energy_ratio_scale2": float(record["energy_ratio_scale2"]),
+                "energy_ratio_fine": float(record["energy_ratio_fine"]),
+            }
         )
     if mappable is not None:
         cbar = fig.colorbar(mappable, ax=axes[:, 2:].ravel().tolist(), fraction=0.018, pad=0.012)
-        cbar.set_label("Signed normalized residual / correction")
-    fig.suptitle("Representative Stage-2 residual decomposition within the validation set", fontsize=13)
-    fig.subplots_adjust(left=0.04, right=0.92, bottom=0.03, top=0.92, wspace=0.03, hspace=0.08)
+        cbar.set_label("Independently normalized signed value")
+    fig.suptitle(
+        "Cases with jointly high scale-2 and scale-4 residual energy\n"
+        "Residual/component maps are independently normalized for structural visibility",
+        fontsize=12,
+    )
+    fig.text(
+        0.5,
+        0.012,
+        "Color intensity is not comparable across residual/component panels; quantitative energy ratios are reported at left.",
+        ha="center",
+        fontsize=8,
+    )
+    fig.subplots_adjust(left=0.09, right=0.92, bottom=0.055, top=0.89, wspace=0.03, hspace=0.15)
     fig.savefig(path, dpi=300, bbox_inches="tight")
     plt.close(fig)
+    return {
+        "method": (
+            "Intersection of independently defined top-energy fractions at scale 2 and scale 4; "
+            "ranked by min(percentile_rank_scale2, percentile_rank_scale4)."
+        ),
+        "top_fraction": top_fraction,
+        "scale2_threshold": threshold2,
+        "scale4_threshold": threshold4,
+        "selected_cases": selected_metadata,
+        "visualization": (
+            "Each signed residual/component panel is independently normalized by its in-mask "
+            "99th absolute percentile and clipped to [-1,1]."
+        ),
+    }
 
 
 def save_energy_figure(rows: list[dict[str, float | str]], path: Path) -> None:
@@ -319,6 +402,7 @@ def main() -> None:
                 **row,
                 "gt": gt,
                 "stage2": stage2,
+                "mask": mask,
                 "residual": np.where(mask, residual, 0.0),
                 "scale4": np.where(mask, scale4, 0.0),
                 "scale2": np.where(mask, scale2, 0.0),
@@ -379,19 +463,19 @@ def main() -> None:
                 ])
             ),
         },
-        "figure_selection": {
-            "method": "Nearest cases to predefined percentiles of min(scale4_ratio, scale2_ratio)",
-            "percentiles": args.representative_percentiles,
-        },
     }
+
+    figure_selection = save_decomposition_figure(
+        records,
+        args.output_dir / "multiscale_residual_decomposition.png",
+        args.figure_cases,
+        args.selection_top_fraction,
+    )
+    summary["figure_selection"] = figure_selection
+
     json_path = args.output_dir / "multiscale_residual_summary.json"
     json_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
 
-    save_decomposition_figure(
-        records,
-        args.output_dir / "multiscale_residual_decomposition.png",
-        args.representative_percentiles,
-    )
     save_energy_figure(rows, args.output_dir / "multiscale_residual_energy.png")
 
     print("\n=== MULTISCALE RESIDUAL ANALYSIS ===")
